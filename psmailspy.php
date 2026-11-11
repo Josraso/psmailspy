@@ -9,6 +9,10 @@
  *  - copia oculta (CCO): el mismo correo que recibe el cliente, idéntico, con sus adjuntos;
  *  - reenvío aparte: un segundo correo con un prefijo en el asunto.
  *
+ * Además guarda los correos de pedidos que envía la tienda para poder reenviártelos cuando quieras,
+ * y vuelve a generar los de pedidos anteriores (confirmación y cambios de estado). Los reenvíos van
+ * solo a los correos configurados en el módulo, nunca al cliente.
+ *
  * Usa solo el hook actionEmailSendBefore de PrestaShop (sin overrides). PrestaShop 1.7 a 9.
  *
  * @author DevTeam / josra
@@ -20,6 +24,7 @@ if (!defined('_PS_VERSION_')) {
 }
 
 require_once dirname(__FILE__) . '/classes/PsmailspyUpdater.php';
+require_once dirname(__FILE__) . '/classes/PsmailspyOrderMails.php';
 
 class Psmailspy extends Module
 {
@@ -35,6 +40,10 @@ class Psmailspy extends Module
     const CONFIG_MODE = 'PSMAILSPY_MODE';
     /** Días que se guarda el registro */
     const CONFIG_LOG_DAYS = 'PSMAILSPY_LOG_DAYS';
+    /** Guardar los correos de pedidos para poder reenviarlos */
+    const CONFIG_STORE = 'PSMAILSPY_STORE';
+    /** Días que se guardan */
+    const CONFIG_STORE_DAYS = 'PSMAILSPY_STORE_DAYS';
 
     /** Opciones de versiones anteriores que ya no se usan */
     const OLD_KEYS = 'PSMAILSPY_SMTP_METHOD,PSMAILSPY_DETECT_METHOD,PSMAILSPY_FALLBACK_MODE';
@@ -49,7 +58,7 @@ class Psmailspy extends Module
     {
         $this->name = 'psmailspy';
         $this->tab = 'administration';
-        $this->version = '2.1.0';
+        $this->version = '2.2.0';
         $this->author = 'DevTeam';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = [
@@ -76,7 +85,8 @@ class Psmailspy extends Module
             && $this->installConfiguration()
             && $this->registerHook('actionEmailSendBefore')
             && $this->getUpdater()->registerHooks()
-            && $this->createLogTable();
+            && $this->createLogTable()
+            && PsmailspyOrderMails::createTable();
     }
 
     public function uninstall()
@@ -86,7 +96,8 @@ class Psmailspy extends Module
 
         return parent::uninstall()
             && $this->uninstallConfiguration()
-            && $this->dropLogTable();
+            && $this->dropLogTable()
+            && PsmailspyOrderMails::dropTable();
     }
 
     public static function defaults()
@@ -101,6 +112,8 @@ class Psmailspy extends Module
             self::CONFIG_SCOPE => 'all',
             self::CONFIG_MODE => 'bcc',
             self::CONFIG_LOG_DAYS => 30,
+            self::CONFIG_STORE => 1,
+            self::CONFIG_STORE_DAYS => 90,
         ];
     }
 
@@ -224,6 +237,16 @@ class Psmailspy extends Module
     {
         $template = isset($params['template']) ? (string) $params['template'] : '';
         $vars = isset($params['templateVars']) && is_array($params['templateVars']) ? $params['templateVars'] : [];
+
+        // Los correos de pedidos se guardan siempre (aunque no se copien) para poder reenviarlos después
+        if (Configuration::get(self::CONFIG_STORE)) {
+            try {
+                PsmailspyOrderMails::store($params, (int) Configuration::get(self::CONFIG_STORE_DAYS));
+            } catch (Exception $e) {
+                error_log('Mail Spy: ' . $e->getMessage());
+            }
+        }
+
         if (!$this->inScope($template, $vars)) {
             return;
         }
@@ -379,6 +402,9 @@ class Psmailspy extends Module
         if (Tools::isSubmit('submitMailSpyTest')) {
             $output .= $this->sendTest();
         }
+        if (Tools::isSubmit('mailspy_resend')) {
+            $output .= $this->resendOrderMails();
+        }
         if (Tools::isSubmit('submitMailSpyClear')) {
             Db::getInstance()->execute('TRUNCATE TABLE `' . _DB_PREFIX_ . 'mailspy_log`');
             $output .= $this->displayConfirmation($this->l('Registro vaciado.'));
@@ -390,7 +416,7 @@ class Psmailspy extends Module
 
         $info = $updater->getInfo();
         $panel = $updater->renderPanel();
-        $forms = $this->displayStats() . $this->displayForm() . $this->displayLog();
+        $forms = $this->displayStats() . $this->displayOrderMails() . $this->displayForm() . $this->displayLog();
 
         return !empty($info['update_available'])
             ? $output . $panel . $forms
@@ -433,42 +459,179 @@ class Psmailspy extends Module
         Configuration::updateValue(self::CONFIG_SCOPE, in_array($scope, ['all', 'orders', 'list'], true) ? $scope : 'all');
         Configuration::updateValue(self::CONFIG_MODE, $mode === 'resend' ? 'resend' : 'bcc');
         Configuration::updateValue(self::CONFIG_LOG_DAYS, max(1, min(365, (int) Tools::getValue(self::CONFIG_LOG_DAYS))));
+        Configuration::updateValue(self::CONFIG_STORE, (int) (bool) Tools::getValue(self::CONFIG_STORE));
+        Configuration::updateValue(self::CONFIG_STORE_DAYS, max(1, min(730, (int) Tools::getValue(self::CONFIG_STORE_DAYS))));
 
         return $this->displayConfirmation($this->l('Configuración guardada correctamente.'));
     }
 
-    /** Correo de prueba a un cliente ficticio: la copia tiene que llegar a los correos configurados */
+    /** Correo de prueba: va directamente y solo a los correos configurados en el módulo */
     private function sendTest()
     {
         $spies = $this->getSpyEmails();
-        if (!Configuration::get(self::CONFIG_ENABLED) || !$spies) {
-            return $this->displayError($this->l('Activa el módulo y guarda al menos un correo antes de probar.'));
+        if (!$spies) {
+            return $this->displayError($this->l('Guarda al menos un correo antes de probar.'));
         }
-        $shopEmail = (string) Configuration::get('PS_SHOP_EMAIL');
-        if (in_array(Tools::strtolower($shopEmail), array_map('strtolower', $spies), true)) {
-            return $this->displayWarning($this->l('El correo de la tienda es uno de los configurados para recibir copias, y no se manda copia a quien ya recibe el correo. Para esta prueba, pon otra dirección.'));
+        self::$sending = true;
+        $failed = [];
+        try {
+            foreach ($spies as $email) {
+                $ok = Mail::send(
+                    (int) $this->context->language->id,
+                    'test',
+                    $this->l('Prueba de Mail Spy'),
+                    [],
+                    $email,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    _PS_MAIL_DIR_,
+                    false,
+                    (int) $this->context->shop->id
+                );
+                if (!$ok) {
+                    $failed[] = $email;
+                }
+            }
+        } catch (Exception $e) {
+            $failed = $spies;
+        } catch (Throwable $e) {
+            $failed = $spies;
         }
-        // Se envía al correo de la tienda con una plantilla de pedido, para que valga con cualquier alcance
-        $ok = Mail::send(
-            (int) $this->context->language->id,
-            'order_customer_comment',
-            $this->l('Prueba de Mail Spy'),
-            ['{firstname}' => 'Mail', '{lastname}' => 'Spy', '{email}' => $shopEmail, '{id_order}' => 0, '{order_name}' => 'PRUEBA',
-                '{message}' => $this->l('Este es un correo de prueba de Mail Spy. Si lo lees en tu correo de copias, el módulo funciona.')],
-            $shopEmail,
-            null,
-            null,
-            null,
-            null,
-            null,
-            _PS_MAIL_DIR_,
-            false,
-            (int) $this->context->shop->id
-        );
+        self::$sending = false;
 
-        return $ok
-            ? $this->displayConfirmation(sprintf($this->l('Correo de prueba enviado a %1$s. La copia tiene que llegar a: %2$s.'), Tools::safeOutput($shopEmail), Tools::safeOutput(implode(', ', $spies))))
-            : $this->displayError($this->l('PrestaShop no ha podido enviar el correo de prueba. Revisa Parámetros avanzados > Email.'));
+        return $failed
+            ? $this->displayError(sprintf($this->l('PrestaShop no ha podido enviar el correo de prueba a %s. Revisa Parámetros avanzados > Email.'), Tools::safeOutput(implode(', ', $failed))))
+            : $this->displayConfirmation(sprintf($this->l('Correo de prueba enviado solo a: %s.'), Tools::safeOutput(implode(', ', $spies))));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Correos de un pedido                                               */
+    /* ------------------------------------------------------------------ */
+
+    private function configUrl($extra = '')
+    {
+        return $this->context->link->getAdminLink('AdminModules', true) . '&configure=' . $this->name . $extra;
+    }
+
+    /** Reenvía a los correos del módulo uno o todos los correos de un pedido */
+    private function resendOrderMails()
+    {
+        $spies = $this->getSpyEmails();
+        if (!$spies) {
+            return $this->displayError($this->l('Guarda al menos un correo en la configuración antes de reenviar.'));
+        }
+        $mails = new PsmailspyOrderMails($this);
+        $order = $mails->findOrder(Tools::getValue('mailspy_order'));
+        if (!$order) {
+            return $this->displayError($this->l('No se encuentra ese pedido.'));
+        }
+        $key = (string) Tools::getValue('mailspy_resend');
+        if ($key === 'all_stored') {
+            $keys = [];
+            foreach ($mails->stored($order->id) as $r) {
+                $keys[] = 's' . (int) $r['id_store'];
+            }
+        } elseif ($key === 'all_regen') {
+            $keys = array_column($mails->regenerable($order), 'key');
+        } else {
+            $keys = [$key];
+        }
+
+        $sent = 0;
+        $errors = [];
+        // Mientras se reenvía, el módulo no copia ni guarda estos correos
+        self::$sending = true;
+        foreach ($keys as $k) {
+            $result = $mails->send($order, $k, $spies);
+            if ($result === true) {
+                ++$sent;
+            } else {
+                $errors[] = Tools::safeOutput($result);
+            }
+        }
+        self::$sending = false;
+
+        $html = '';
+        if ($sent) {
+            $html .= $this->displayConfirmation(sprintf($this->l('Pedido %1$s: %2$d correo(s) reenviado(s) solo a %3$s.'), Tools::safeOutput($order->reference), $sent, Tools::safeOutput(implode(', ', $spies))));
+        }
+        if ($errors) {
+            $html .= $this->displayError(implode('<br>', array_unique($errors)));
+        }
+
+        return $html;
+    }
+
+    private function displayOrderMails()
+    {
+        $mails = new PsmailspyOrderMails($this);
+        $query = trim((string) Tools::getValue('mailspy_order'));
+        $action = Tools::safeOutput($this->configUrl());
+        $spies = $this->getSpyEmails();
+        $date = function ($d) {
+            return Tools::safeOutput(date('d/m/Y H:i', strtotime($d)));
+        };
+        $button = function ($idOrder, $key, $label, $class = 'btn-default btn-sm') use ($action) {
+            return '<form method="post" action="' . $action . '" style="display:inline"><input type="hidden" name="mailspy_order" value="' . (int) $idOrder . '">'
+                . '<button type="submit" name="mailspy_resend" value="' . Tools::safeOutput($key) . '" class="btn ' . $class . '"><i class="icon-share-alt"></i> ' . $label . '</button></form>';
+        };
+
+        $html = '<div class="panel" id="mailspy_orders"><div class="panel-heading"><i class="icon-shopping-cart"></i> ' . $this->l('Reenviarme los correos de un pedido') . '</div>'
+            . '<p class="help-block">' . sprintf($this->l('Los reenvíos van solo a los correos configurados en este módulo (%s), nunca al cliente. El asunto lleva el prefijo configurado.'),
+                $spies ? Tools::safeOutput(implode(', ', $spies)) : '<strong>' . $this->l('todavía ninguno') . '</strong>') . '</p>'
+            . '<form method="post" action="' . $action . '#mailspy_orders" class="form-inline" style="margin-bottom:15px">'
+            . '<input type="text" name="mailspy_order" class="form-control" style="width:260px;display:inline-block" value="' . Tools::safeOutput($query) . '" placeholder="' . $this->l('Número o referencia del pedido') . '"> '
+            . '<button type="submit" name="mailspy_find" class="btn btn-primary"><i class="icon-search"></i> ' . $this->l('Buscar pedido') . '</button></form>';
+
+        if ($query !== '') {
+            $order = $mails->findOrder($query);
+            if (!$order) {
+                $html .= '<div class="alert alert-warning">' . $this->l('No se encuentra ningún pedido con ese número o referencia.') . '</div>';
+            } else {
+                $customer = new Customer((int) $order->id_customer);
+                $html .= '<h4>' . sprintf($this->l('Pedido %1$s (nº %2$d) · %3$s · %4$s'), Tools::safeOutput($order->reference), (int) $order->id,
+                    Tools::safeOutput($customer->firstname . ' ' . $customer->lastname), $date($order->date_add)) . '</h4>';
+
+                $stored = $mails->stored($order->id);
+                $html .= '<h4 style="margin-top:20px">' . $this->l('Correos que se enviaron (copia exacta)') . '</h4>';
+                if (!$stored) {
+                    $html .= '<p class="text-muted">' . $this->l('No hay correos guardados de este pedido: se envió antes de instalar esta versión, o guardar correos estaba desactivado. Puedes volver a generarlos abajo.') . '</p>';
+                } else {
+                    $html .= '<table class="table table-condensed"><thead><tr><th>' . $this->l('Fecha') . '</th><th>' . $this->l('Asunto') . '</th><th>' . $this->l('Plantilla') . '</th><th>'
+                        . $this->l('Se envió a') . '</th><th class="text-right">' . $button($order->id, 'all_stored', $this->l('Reenviarme todos'), 'btn-primary btn-sm') . '</th></tr></thead><tbody>';
+                    foreach ($stored as $r) {
+                        $html .= '<tr><td style="white-space:nowrap">' . $date($r['date_add']) . '</td><td>' . Tools::safeOutput($r['subject']) . '</td><td><code>' . Tools::safeOutput($r['template'])
+                            . '</code></td><td>' . Tools::safeOutput($r['recipient']) . '</td><td class="text-right">' . $button($order->id, 's' . (int) $r['id_store'], $this->l('Reenviármelo')) . '</td></tr>';
+                    }
+                    $html .= '</tbody></table>';
+                }
+
+                $html .= '<h4 style="margin-top:20px">' . $this->l('Volver a generarlos') . '</h4>'
+                    . '<p class="help-block">' . $this->l('La confirmación del pedido y el correo de cada cambio de estado, montados ahora con los datos actuales del pedido y las plantillas actuales. Sirven para pedidos antiguos; pueden no ser idénticos a lo que recibió el cliente.') . '</p>'
+                    . '<table class="table table-condensed"><thead><tr><th>' . $this->l('Fecha') . '</th><th>' . $this->l('Correo') . '</th><th>' . $this->l('Plantilla') . '</th><th class="text-right">'
+                    . $button($order->id, 'all_regen', $this->l('Reenviarme todos'), 'btn-primary btn-sm') . '</th></tr></thead><tbody>';
+                foreach ($mails->regenerable($order) as $r) {
+                    $html .= '<tr><td style="white-space:nowrap">' . $date($r['date']) . '</td><td>' . Tools::safeOutput($r['label']) . '</td><td><code>' . Tools::safeOutput($r['template'])
+                        . '</code></td><td class="text-right">' . $button($order->id, $r['key'], $this->l('Reenviármelo')) . '</td></tr>';
+                }
+                $html .= '</tbody></table>';
+            }
+        } else {
+            $html .= '<table class="table table-condensed"><thead><tr><th>' . $this->l('Últimos pedidos') . '</th><th>' . $this->l('Cliente') . '</th><th>' . $this->l('Fecha') . '</th><th class="text-center">'
+                . $this->l('Correos guardados') . '</th><th></th></tr></thead><tbody>';
+            foreach ($mails->latestOrders(10) as $o) {
+                $html .= '<tr><td><code>' . Tools::safeOutput($o['reference']) . '</code> <span class="text-muted">nº ' . (int) $o['id_order'] . '</span></td><td>' . Tools::safeOutput($o['firstname'] . ' ' . $o['lastname'])
+                    . '</td><td style="white-space:nowrap">' . $date($o['date_add']) . '</td><td class="text-center">' . (int) $o['stored'] . '</td><td class="text-right">'
+                    . '<form method="post" action="' . $action . '#mailspy_orders" style="display:inline"><input type="hidden" name="mailspy_order" value="' . (int) $o['id_order'] . '">'
+                    . '<button type="submit" name="mailspy_find" class="btn btn-default btn-sm"><i class="icon-envelope"></i> ' . $this->l('Ver sus correos') . '</button></form></td></tr>';
+            }
+            $html .= '</tbody></table>';
+        }
+
+        return $html . '</div>';
     }
 
     private function displayStats()
@@ -605,6 +768,14 @@ class Psmailspy extends Module
                         'class' => 'fixed-width-sm',
                         'suffix' => $this->l('días'),
                     ],
+                    $this->switchField(self::CONFIG_STORE, $this->l('Guardar los correos de pedidos'), $this->l('Guarda cada correo de pedido que envía la tienda (plantilla, asunto y datos) para poder reenviártelo después tal como salió. No guarda los adjuntos.')),
+                    [
+                        'type' => 'text',
+                        'label' => $this->l('Conservar los correos guardados'),
+                        'name' => self::CONFIG_STORE_DAYS,
+                        'class' => 'fixed-width-sm',
+                        'suffix' => $this->l('días'),
+                    ],
                 ],
                 'submit' => [
                     'title' => $this->l('Guardar configuración'),
@@ -662,7 +833,7 @@ class Psmailspy extends Module
                 . Tools::safeOutput($r['subject']) . '</td><td><code>' . Tools::safeOutput($r['template']) . '</code></td><td>' . Tools::safeOutput($r['spy_recipients']) . '</td><td>'
                 . ($r['error_message'] === 'reenvio' ? $this->l('Reenvío') : $this->l('CCO')) . '</td></tr>';
         }
-        $url = $this->context->link->getAdminLink('AdminModules', true) . '&configure=' . $this->name;
+        $url = $this->configUrl();
 
         return $html . '</tbody></table></div>'
             . '<form method="post" action="' . Tools::safeOutput($url) . '" class="panel-footer"><button type="submit" name="submitMailSpyClear" class="btn btn-default" onclick="return confirm(\''
