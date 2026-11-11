@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+    <name>psmailspy</name>
+    <displayName><![CDATA[Mail Spy Pro]]></displayName>
+    <version><![CDATA[2.1.0]]></version>
+    <description><![CDATA[Envía a tu correo una copia de los emails que manda la tienda (todos, solo los de pedidos o las plantillas que elijas) para comprobar cómo llegan.]]></description>
+    <author><![CDATA[DevTeam]]></author>
+    <tab><![CDATA[administration]]></tab>
+    <confirmUninstall><![CDATA[¿Estás seguro de que quieres desinstalar Mail Spy Pro?]]></confirmUninstall>
+    <is_configurable>1</is_configurable>
+    <need_instance>0</need_instance>
+    <limited_countries></limited_countries>
+</module>

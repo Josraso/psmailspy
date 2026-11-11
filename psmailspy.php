@@ -1,16 +1,25 @@
 <?php
 /**
- * Mail Spy Module for PrestaShop 1.7+ and 8.x
- * Advanced email interceptor with professional interface
- * 
- * @author DevTeam
- * @version 2.0.0
+ * Mail Spy Pro - copia de los correos que envía la tienda
+ *
+ * Envía a los correos que configures una copia de lo que la tienda manda a los clientes
+ * (todos los correos, solo los de pedidos o solo unas plantillas) para comprobar cómo llegan.
+ *
+ * Dos formas de copiar:
+ *  - copia oculta (CCO): el mismo correo que recibe el cliente, idéntico, con sus adjuntos;
+ *  - reenvío aparte: un segundo correo con un prefijo en el asunto.
+ *
+ * Usa solo el hook actionEmailSendBefore de PrestaShop (sin overrides). PrestaShop 1.7 a 9.
+ *
+ * @author DevTeam / josra
  * @license MIT
  */
 
 if (!defined('_PS_VERSION_')) {
     exit;
 }
+
+require_once dirname(__FILE__) . '/classes/PsmailspyUpdater.php';
 
 class Psmailspy extends Module
 {
@@ -20,15 +29,27 @@ class Psmailspy extends Module
     const CONFIG_LOG_ENABLED = 'PSMAILSPY_LOG_ENABLED';
     const CONFIG_MULTIPLE_EMAILS = 'PSMAILSPY_MULTIPLE_EMAILS';
     const CONFIG_FILTER_TEMPLATES = 'PSMAILSPY_FILTER_TEMPLATES';
-    const CONFIG_SMTP_METHOD = 'PSMAILSPY_SMTP_METHOD';
-    const CONFIG_DETECT_METHOD = 'PSMAILSPY_DETECT_METHOD';
-    const CONFIG_FALLBACK_MODE = 'PSMAILSPY_FALLBACK_MODE';
+    /** Qué correos se copian: all | orders | list */
+    const CONFIG_SCOPE = 'PSMAILSPY_SCOPE';
+    /** Cómo se copian: bcc | resend */
+    const CONFIG_MODE = 'PSMAILSPY_MODE';
+    /** Días que se guarda el registro */
+    const CONFIG_LOG_DAYS = 'PSMAILSPY_LOG_DAYS';
+
+    /** Opciones de versiones anteriores que ya no se usan */
+    const OLD_KEYS = 'PSMAILSPY_SMTP_METHOD,PSMAILSPY_DETECT_METHOD,PSMAILSPY_FALLBACK_MODE';
+
+    /** Hooks que registraba la 2.0.0 y que PrestaShop no tiene */
+    const OLD_HOOKS = 'actionEmailSendAfter,actionObjectMailMessageSendBefore,actionObjectMailMessageSendAfter,actionMailSend,displayBackOfficeHeader';
+
+    /** Para no copiar la copia cuando se reenvía aparte */
+    private static $sending = false;
 
     public function __construct()
     {
         $this->name = 'psmailspy';
         $this->tab = 'administration';
-        $this->version = '2.0.0';
+        $this->version = '2.1.0';
         $this->author = 'DevTeam';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = [
@@ -41,54 +62,64 @@ class Psmailspy extends Module
         parent::__construct();
 
         $this->displayName = $this->l('Mail Spy Pro');
-        $this->description = $this->l('Intercepta y reenvía emails salientes con configuración avanzada y logging.');
+        $this->description = $this->l('Envía a tu correo una copia de los emails que manda la tienda (todos, solo los de pedidos o las plantillas que elijas) para comprobar cómo llegan.');
         $this->confirmUninstall = $this->l('¿Estás seguro de que quieres desinstalar Mail Spy Pro?');
     }
+
+    /* ------------------------------------------------------------------ */
+    /*  Instalación                                                        */
+    /* ------------------------------------------------------------------ */
 
     public function install()
     {
         return parent::install()
             && $this->installConfiguration()
             && $this->registerHook('actionEmailSendBefore')
-            && $this->registerHook('actionEmailSendAfter')
-            && $this->registerHook('actionObjectMailMessageSendBefore')
-            && $this->registerHook('actionObjectMailMessageSendAfter')
-            && $this->registerHook('actionMailSend')
-            && $this->registerHook('displayBackOfficeHeader')
+            && $this->getUpdater()->registerHooks()
             && $this->createLogTable();
     }
 
     public function uninstall()
     {
+        // Aviso al servidor de actualizaciones (no impide desinstalar si no responde)
+        $this->getUpdater()->notifyUninstall();
+
         return parent::uninstall()
             && $this->uninstallConfiguration()
             && $this->dropLogTable();
     }
 
+    public static function defaults()
+    {
+        return [
+            self::CONFIG_EMAIL => '',
+            self::CONFIG_ENABLED => 1,
+            self::CONFIG_PREFIX => '[MAIL SPY]',
+            self::CONFIG_LOG_ENABLED => 1,
+            self::CONFIG_MULTIPLE_EMAILS => '',
+            self::CONFIG_FILTER_TEMPLATES => '',
+            self::CONFIG_SCOPE => 'all',
+            self::CONFIG_MODE => 'bcc',
+            self::CONFIG_LOG_DAYS => 30,
+        ];
+    }
+
     private function installConfiguration()
     {
-        return Configuration::updateValue(self::CONFIG_EMAIL, '')
-            && Configuration::updateValue(self::CONFIG_ENABLED, true)
-            && Configuration::updateValue(self::CONFIG_PREFIX, '[MAIL SPY]')
-            && Configuration::updateValue(self::CONFIG_LOG_ENABLED, true)
-            && Configuration::updateValue(self::CONFIG_MULTIPLE_EMAILS, '')
-            && Configuration::updateValue(self::CONFIG_FILTER_TEMPLATES, '')
-            && Configuration::updateValue(self::CONFIG_SMTP_METHOD, 'both')
-            && Configuration::updateValue(self::CONFIG_DETECT_METHOD, true)
-            && Configuration::updateValue(self::CONFIG_FALLBACK_MODE, true);
+        foreach (self::defaults() as $key => $value) {
+            Configuration::updateValue($key, $value);
+        }
+
+        return true;
     }
 
     private function uninstallConfiguration()
     {
-        return Configuration::deleteByName(self::CONFIG_EMAIL)
-            && Configuration::deleteByName(self::CONFIG_ENABLED)
-            && Configuration::deleteByName(self::CONFIG_PREFIX)
-            && Configuration::deleteByName(self::CONFIG_LOG_ENABLED)
-            && Configuration::deleteByName(self::CONFIG_MULTIPLE_EMAILS)
-            && Configuration::deleteByName(self::CONFIG_FILTER_TEMPLATES)
-            && Configuration::deleteByName(self::CONFIG_SMTP_METHOD)
-            && Configuration::deleteByName(self::CONFIG_DETECT_METHOD)
-            && Configuration::deleteByName(self::CONFIG_FALLBACK_MODE);
+        foreach (array_merge(array_keys(self::defaults()), explode(',', self::OLD_KEYS), ['PSMAILSPY_UPD_TS', 'PSMAILSPY_UPD_INFO']) as $key) {
+            Configuration::deleteByName($key);
+        }
+
+        return true;
     }
 
     private function createLogTable()
@@ -114,45 +145,276 @@ class Psmailspy extends Module
         return Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'mailspy_log`');
     }
 
-    public function getContent()
+    /**
+     * De la 2.0.0 a la 2.1.0: quita los hooks que PrestaShop no tiene y las opciones que no hacían nada,
+     * y deja el alcance como estaba (todas las plantillas, o las de la lista si había filtro).
+     */
+    public function migrateFrom20()
     {
-        $output = '';
+        foreach (explode(',', self::OLD_HOOKS) as $hook) {
+            if ($this->isRegisteredInHook($hook)) {
+                $this->unregisterHook($hook);
+            }
+        }
+        foreach (explode(',', self::OLD_KEYS) as $key) {
+            Configuration::deleteByName($key);
+        }
+        if (Configuration::get(self::CONFIG_SCOPE) === false) {
+            Configuration::updateValue(self::CONFIG_SCOPE, trim((string) Configuration::get(self::CONFIG_FILTER_TEMPLATES)) !== '' ? 'list' : 'all');
+        }
+        if (Configuration::get(self::CONFIG_MODE) === false) {
+            Configuration::updateValue(self::CONFIG_MODE, 'bcc');
+        }
+        if (Configuration::get(self::CONFIG_LOG_DAYS) === false) {
+            Configuration::updateValue(self::CONFIG_LOG_DAYS, 30);
+        }
+        // El registro anterior guardaba filas «confirmed» y «failed» de hooks que nunca se ejecutaban
+        Db::getInstance()->execute('DELETE FROM `' . _DB_PREFIX_ . 'mailspy_log` WHERE `status` <> "sent"');
 
-        if (Tools::isSubmit('submitMailSpyConfig')) {
-            if (!Tools::getToken(false)) {
-                $output .= $this->displayError($this->l('Token de seguridad inválido.'));
-            } else {
-                $output .= $this->processForm();
+        return $this->createLogTable()
+            && ($this->isRegisteredInHook('actionEmailSendBefore') || $this->registerHook('actionEmailSendBefore'))
+            && $this->getUpdater()->registerHooks();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Actualizaciones                                                    */
+    /* ------------------------------------------------------------------ */
+
+    public function getUpdater()
+    {
+        return new PsmailspyUpdater($this);
+    }
+
+    /** Aviso periódico al servidor de actualizaciones (solo en el back-office) */
+    public function hookActionAdminControllerSetMedia($params)
+    {
+        $this->getUpdater()->maybePing();
+    }
+
+    /** PS 8.1+: la versión nueva aparece en Gestor de módulos > Actualizaciones */
+    public function hookActionListModules($params)
+    {
+        return $this->getUpdater()->getNativeModuleList();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Copia de los correos                                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * PrestaShop llama aquí antes de enviar cada correo. Los parámetros van por referencia.
+     * Siempre devuelve true: si devolviera false, PrestaShop no enviaría el correo.
+     */
+    public function hookActionEmailSendBefore($params)
+    {
+        try {
+            if (Configuration::get(self::CONFIG_ENABLED) && !self::$sending) {
+                $this->copyEmail($params);
+            }
+        } catch (Exception $e) {
+            error_log('Mail Spy: ' . $e->getMessage());
+        } catch (Throwable $e) {
+            error_log('Mail Spy: ' . $e->getMessage());
+        }
+
+        return true;
+    }
+
+    private function copyEmail(&$params)
+    {
+        $template = isset($params['template']) ? (string) $params['template'] : '';
+        $vars = isset($params['templateVars']) && is_array($params['templateVars']) ? $params['templateVars'] : [];
+        if (!$this->inScope($template, $vars)) {
+            return;
+        }
+
+        // No se manda copia a quien ya recibe el correo
+        $recipients = [];
+        foreach ((array) (isset($params['to']) ? $params['to'] : []) as $to) {
+            $recipients[] = Tools::strtolower(trim((string) $to));
+        }
+        $spies = [];
+        foreach ($this->getSpyEmails() as $email) {
+            if (!in_array(Tools::strtolower($email), $recipients, true)) {
+                $spies[] = $email;
+            }
+        }
+        if (!$spies) {
+            return;
+        }
+
+        $mode = Configuration::get(self::CONFIG_MODE) === 'resend' || !array_key_exists('bcc', $params) ? 'resend' : 'bcc';
+        if ($mode === 'bcc') {
+            $bcc = [];
+            foreach ((array) $params['bcc'] as $addr) {
+                if (is_string($addr) && trim($addr) !== '') {
+                    $bcc[] = trim($addr);
+                }
+            }
+            foreach ($spies as $email) {
+                if (!in_array($email, $bcc, true)) {
+                    $bcc[] = $email;
+                }
+            }
+            $params['bcc'] = $bcc;
+        } else {
+            $this->resend($params, $spies);
+        }
+
+        if (Configuration::get(self::CONFIG_LOG_ENABLED)) {
+            $this->logEmail($params, $spies, $mode);
+        }
+    }
+
+    /** Plantillas de pedidos de PrestaShop y de los módulos de pago y avisos habituales */
+    public static function orderTemplates()
+    {
+        return ['order_conf', 'payment', 'payment_error', 'bankwire', 'cheque', 'cashondelivery', 'preparation', 'shipped', 'in_transit',
+            'order_canceled', 'refund', 'outofstock', 'order_changed', 'order_merchandise_return', 'order_return_state', 'credit_slip',
+            'download_product', 'order_customer_comment', 'order_merchant_comment', 'new_order', 'return_slip', 'backoffice_order'];
+    }
+
+    private function inScope($template, array $vars)
+    {
+        $scope = (string) Configuration::get(self::CONFIG_SCOPE);
+        if ($scope === 'orders') {
+            // Por plantilla o porque el correo lleva el número o la referencia de un pedido
+            return in_array($template, self::orderTemplates(), true)
+                || isset($vars['{order_name}']) || isset($vars['{id_order}']);
+        }
+        if ($scope === 'list') {
+            $list = array_filter(array_map('trim', explode(',', (string) Configuration::get(self::CONFIG_FILTER_TEMPLATES))));
+
+            return !$list || in_array($template, $list, true);
+        }
+
+        return true;
+    }
+
+    private function getSpyEmails()
+    {
+        $emails = [];
+        $all = Configuration::get(self::CONFIG_EMAIL) . ',' . Configuration::get(self::CONFIG_MULTIPLE_EMAILS);
+        foreach (preg_split('/[,;\s]+/', (string) $all) as $email) {
+            $email = trim($email);
+            if ($email !== '' && Validate::isEmail($email) && !in_array($email, $emails, true)) {
+                $emails[] = $email;
             }
         }
 
-        $output .= $this->displayStats();
-        $output .= $this->displayForm();
+        return $emails;
+    }
 
-        return $output;
+    /** Reenvío aparte: el mismo correo otra vez, a cada dirección, con el prefijo en el asunto */
+    private function resend(array $params, array $spies)
+    {
+        $prefix = trim((string) Configuration::get(self::CONFIG_PREFIX));
+        $subject = ($prefix !== '' ? $prefix . ' ' : '') . (isset($params['subject']) ? $params['subject'] : '');
+        $get = function ($key, $default = null) use ($params) {
+            return isset($params[$key]) ? $params[$key] : $default;
+        };
+
+        self::$sending = true;
+        try {
+            foreach ($spies as $email) {
+                Mail::send(
+                    (int) $get('idLang', Configuration::get('PS_LANG_DEFAULT')),
+                    $get('template'),
+                    $subject,
+                    $get('templateVars', []),
+                    $email,
+                    null,
+                    $get('from'),
+                    $get('fromName'),
+                    $get('fileAttachment'),
+                    $get('mode_smtp'),
+                    $get('templatePath', _PS_MAIL_DIR_),
+                    false,
+                    $get('idShop')
+                );
+            }
+        } catch (Exception $e) {
+            error_log('Mail Spy: ' . $e->getMessage());
+        } catch (Throwable $e) {
+            error_log('Mail Spy: ' . $e->getMessage());
+        }
+        self::$sending = false;
+    }
+
+    private function logEmail(array $params, array $spies, $mode)
+    {
+        try {
+            $to = implode(', ', array_map('strval', (array) (isset($params['to']) ? $params['to'] : [])));
+            Db::getInstance()->insert('mailspy_log', [
+                'date_add' => date('Y-m-d H:i:s'),
+                'recipient' => pSQL(Tools::substr($to, 0, 250)),
+                'subject' => pSQL(Tools::substr(isset($params['subject']) ? (string) $params['subject'] : '', 0, 490)),
+                'template' => pSQL(Tools::substr(isset($params['template']) ? (string) $params['template'] : '', 0, 90)),
+                'status' => 'sent',
+                'error_message' => pSQL($mode === 'bcc' ? 'cco' : 'reenvio'),
+                'spy_recipients' => pSQL(Tools::substr(implode(', ', $spies), 0, 500)),
+            ]);
+            // Limpieza de vez en cuando
+            if (mt_rand(1, 50) === 1) {
+                $days = max(1, (int) Configuration::get(self::CONFIG_LOG_DAYS));
+                Db::getInstance()->execute('DELETE FROM `' . _DB_PREFIX_ . 'mailspy_log` WHERE `date_add` < DATE_SUB(NOW(), INTERVAL ' . $days . ' DAY)');
+            }
+        } catch (Exception $e) {
+            error_log('Mail Spy: ' . $e->getMessage());
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Configuración                                                      */
+    /* ------------------------------------------------------------------ */
+
+    public function getContent()
+    {
+        $updater = $this->getUpdater();
+        $output = $updater->processRequest();
+
+        if (Tools::isSubmit('submitMailSpyConfig')) {
+            $output .= $this->processForm();
+        }
+        if (Tools::isSubmit('submitMailSpyTest')) {
+            $output .= $this->sendTest();
+        }
+        if (Tools::isSubmit('submitMailSpyClear')) {
+            Db::getInstance()->execute('TRUNCATE TABLE `' . _DB_PREFIX_ . 'mailspy_log`');
+            $output .= $this->displayConfirmation($this->l('Registro vaciado.'));
+        }
+
+        if (Configuration::get(self::CONFIG_ENABLED) && !$this->getSpyEmails()) {
+            $output .= $this->displayWarning($this->l('El módulo está activado pero no hay ningún correo configurado: no se envía ninguna copia.'));
+        }
+
+        $info = $updater->getInfo();
+        $panel = $updater->renderPanel();
+        $forms = $this->displayStats() . $this->displayForm() . $this->displayLog();
+
+        return !empty($info['update_available'])
+            ? $output . $panel . $forms
+            : $output . $forms . $panel;
     }
 
     private function processForm()
     {
         $errors = [];
-        
-        $email = Tools::getValue(self::CONFIG_EMAIL);
-        if (!empty($email) && !Validate::isEmail($email)) {
+
+        $email = trim((string) Tools::getValue(self::CONFIG_EMAIL));
+        if ($email !== '' && !Validate::isEmail($email)) {
             $errors[] = $this->l('Email principal no válido.');
         }
 
-        $multipleEmails = Tools::getValue(self::CONFIG_MULTIPLE_EMAILS);
-        if (!empty($multipleEmails)) {
-            $emails = array_map('trim', explode(',', $multipleEmails));
-            foreach ($emails as $emailItem) {
-                if (!empty($emailItem) && !Validate::isEmail($emailItem)) {
-                    $errors[] = sprintf($this->l('Email no válido: %s'), $emailItem);
-                }
+        $multipleEmails = trim((string) Tools::getValue(self::CONFIG_MULTIPLE_EMAILS));
+        foreach (preg_split('/[,;\s]+/', $multipleEmails) as $emailItem) {
+            if ($emailItem !== '' && !Validate::isEmail($emailItem)) {
+                $errors[] = sprintf($this->l('Email no válido: %s'), Tools::safeOutput($emailItem));
             }
         }
 
-        $prefix = Tools::getValue(self::CONFIG_PREFIX);
-        if (strlen($prefix) > 50) {
+        $prefix = (string) Tools::getValue(self::CONFIG_PREFIX);
+        if (Tools::strlen($prefix) > 50) {
             $errors[] = $this->l('El prefijo no puede tener más de 50 caracteres.');
         }
 
@@ -160,21 +422,53 @@ class Psmailspy extends Module
             return $this->displayError(implode('<br>', $errors));
         }
 
-        $success = Configuration::updateValue(self::CONFIG_EMAIL, $email)
-            && Configuration::updateValue(self::CONFIG_ENABLED, (bool)Tools::getValue(self::CONFIG_ENABLED))
-            && Configuration::updateValue(self::CONFIG_PREFIX, $prefix)
-            && Configuration::updateValue(self::CONFIG_LOG_ENABLED, (bool)Tools::getValue(self::CONFIG_LOG_ENABLED))
-            && Configuration::updateValue(self::CONFIG_MULTIPLE_EMAILS, $multipleEmails)
-            && Configuration::updateValue(self::CONFIG_FILTER_TEMPLATES, Tools::getValue(self::CONFIG_FILTER_TEMPLATES))
-            && Configuration::updateValue(self::CONFIG_SMTP_METHOD, Tools::getValue(self::CONFIG_SMTP_METHOD))
-            && Configuration::updateValue(self::CONFIG_DETECT_METHOD, (bool)Tools::getValue(self::CONFIG_DETECT_METHOD))
-            && Configuration::updateValue(self::CONFIG_FALLBACK_MODE, (bool)Tools::getValue(self::CONFIG_FALLBACK_MODE));
+        $scope = (string) Tools::getValue(self::CONFIG_SCOPE);
+        $mode = (string) Tools::getValue(self::CONFIG_MODE);
+        Configuration::updateValue(self::CONFIG_EMAIL, $email);
+        Configuration::updateValue(self::CONFIG_ENABLED, (int) (bool) Tools::getValue(self::CONFIG_ENABLED));
+        Configuration::updateValue(self::CONFIG_PREFIX, $prefix);
+        Configuration::updateValue(self::CONFIG_LOG_ENABLED, (int) (bool) Tools::getValue(self::CONFIG_LOG_ENABLED));
+        Configuration::updateValue(self::CONFIG_MULTIPLE_EMAILS, $multipleEmails);
+        Configuration::updateValue(self::CONFIG_FILTER_TEMPLATES, trim((string) Tools::getValue(self::CONFIG_FILTER_TEMPLATES)));
+        Configuration::updateValue(self::CONFIG_SCOPE, in_array($scope, ['all', 'orders', 'list'], true) ? $scope : 'all');
+        Configuration::updateValue(self::CONFIG_MODE, $mode === 'resend' ? 'resend' : 'bcc');
+        Configuration::updateValue(self::CONFIG_LOG_DAYS, max(1, min(365, (int) Tools::getValue(self::CONFIG_LOG_DAYS))));
 
-        if ($success) {
-            return $this->displayConfirmation($this->l('Configuración guardada correctamente.'));
-        } else {
-            return $this->displayError($this->l('Error al guardar la configuración.'));
+        return $this->displayConfirmation($this->l('Configuración guardada correctamente.'));
+    }
+
+    /** Correo de prueba a un cliente ficticio: la copia tiene que llegar a los correos configurados */
+    private function sendTest()
+    {
+        $spies = $this->getSpyEmails();
+        if (!Configuration::get(self::CONFIG_ENABLED) || !$spies) {
+            return $this->displayError($this->l('Activa el módulo y guarda al menos un correo antes de probar.'));
         }
+        $shopEmail = (string) Configuration::get('PS_SHOP_EMAIL');
+        if (in_array(Tools::strtolower($shopEmail), array_map('strtolower', $spies), true)) {
+            return $this->displayWarning($this->l('El correo de la tienda es uno de los configurados para recibir copias, y no se manda copia a quien ya recibe el correo. Para esta prueba, pon otra dirección.'));
+        }
+        // Se envía al correo de la tienda con una plantilla de pedido, para que valga con cualquier alcance
+        $ok = Mail::send(
+            (int) $this->context->language->id,
+            'order_customer_comment',
+            $this->l('Prueba de Mail Spy'),
+            ['{firstname}' => 'Mail', '{lastname}' => 'Spy', '{email}' => $shopEmail, '{id_order}' => 0, '{order_name}' => 'PRUEBA',
+                '{message}' => $this->l('Este es un correo de prueba de Mail Spy. Si lo lees en tu correo de copias, el módulo funciona.')],
+            $shopEmail,
+            null,
+            null,
+            null,
+            null,
+            null,
+            _PS_MAIL_DIR_,
+            false,
+            (int) $this->context->shop->id
+        );
+
+        return $ok
+            ? $this->displayConfirmation(sprintf($this->l('Correo de prueba enviado a %1$s. La copia tiene que llegar a: %2$s.'), Tools::safeOutput($shopEmail), Tools::safeOutput(implode(', ', $spies))))
+            : $this->displayError($this->l('PrestaShop no ha podido enviar el correo de prueba. Revisa Parámetros avanzados > Email.'));
     }
 
     private function displayStats()
@@ -184,64 +478,64 @@ class Psmailspy extends Module
         }
 
         $stats = $this->getMailStats();
-        
-        $html = '<div class="panel">
-            <div class="panel-heading">
-                <i class="icon-bar-chart"></i> ' . $this->l('Estadísticas de Emails') . '
-            </div>
-            <div class="panel-body">
-                <div class="row">
-                    <div class="col-md-3">
-                        <div class="alert alert-info">
-                            <h4>' . (int)$stats['total_today'] . '</h4>
-                            <p>' . $this->l('Emails hoy') . '</p>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <div class="alert alert-success">
-                            <h4>' . (int)$stats['total_week'] . '</h4>
-                            <p>' . $this->l('Esta semana') . '</p>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <div class="alert alert-warning">
-                            <h4>' . (int)$stats['total_month'] . '</h4>
-                            <p>' . $this->l('Este mes') . '</p>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <div class="alert alert-danger">
-                            <h4>' . (int)$stats['failed'] . '</h4>
-                            <p>' . $this->l('Fallos recientes') . '</p>
-                        </div>
-                    </div>
-                </div>
-                <div class="row">
-                    <div class="col-md-12">
-                        <div class="alert alert-info">
-                            <h5><i class="icon-gear"></i> ' . $this->l('Configuración detectada') . '</h5>
-                            <p><strong>' . $this->l('Método de email') . ':</strong> ' . $this->getDetectedEmailMethod() . '</p>
-                            <p><strong>' . $this->l('Hooks activos') . ':</strong> ' . $this->getActiveHooksInfo() . '</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>';
+        $box = function ($class, $value, $label) {
+            return '<div class="col-md-3"><div class="alert alert-' . $class . '"><h4>' . (int) $value . '</h4><p>' . $label . '</p></div></div>';
+        };
 
-        return $html;
+        return '<div class="panel">
+            <div class="panel-heading"><i class="icon-bar-chart"></i> ' . $this->l('Correos copiados') . '</div>
+            <div class="row">'
+                . $box('info', $stats['total_today'], $this->l('Hoy'))
+                . $box('success', $stats['total_week'], $this->l('Últimos 7 días'))
+                . $box('warning', $stats['total_month'], $this->l('Últimos 30 días'))
+                . $box('info', $stats['orders_week'], $this->l('De pedidos, últimos 7 días'))
+            . '</div>
+            <p class="help-block">' . $this->l('Método de envío de la tienda') . ': <strong>' . $this->getDetectedEmailMethod() . '</strong></p>
+        </div>';
     }
 
     private function getMailStats()
     {
-        $sql = 'SELECT 
+        $in = '"' . implode('","', array_map('pSQL', self::orderTemplates())) . '"';
+        $sql = 'SELECT
                     SUM(CASE WHEN DATE(date_add) = CURDATE() THEN 1 ELSE 0 END) as total_today,
                     SUM(CASE WHEN date_add >= DATE_SUB(NOW(), INTERVAL 1 WEEK) THEN 1 ELSE 0 END) as total_week,
                     SUM(CASE WHEN date_add >= DATE_SUB(NOW(), INTERVAL 1 MONTH) THEN 1 ELSE 0 END) as total_month,
-                    SUM(CASE WHEN status = "failed" AND date_add >= DATE_SUB(NOW(), INTERVAL 1 WEEK) THEN 1 ELSE 0 END) as failed
-                FROM `' . _DB_PREFIX_ . 'mailspy_log`';
-        
+                    SUM(CASE WHEN template IN (' . $in . ') AND date_add >= DATE_SUB(NOW(), INTERVAL 1 WEEK) THEN 1 ELSE 0 END) as orders_week
+                FROM `' . _DB_PREFIX_ . 'mailspy_log` WHERE `status` = "sent"';
+
         $result = Db::getInstance()->getRow($sql);
-        return $result ?: ['total_today' => 0, 'total_week' => 0, 'total_month' => 0, 'failed' => 0];
+
+        return $result ?: ['total_today' => 0, 'total_week' => 0, 'total_month' => 0, 'orders_week' => 0];
+    }
+
+    private function getDetectedEmailMethod()
+    {
+        switch ((string) Configuration::get('PS_MAIL_METHOD')) {
+            case '1':
+                return $this->l('función mail() de PHP / sendmail');
+            case '2':
+                $server = (string) Configuration::get('PS_MAIL_SERVER');
+
+                return $this->l('SMTP') . ($server !== '' ? ' (' . Tools::safeOutput($server) . ')' : '');
+            default:
+                return $this->l('desactivado: la tienda no envía correos');
+        }
+    }
+
+    private function switchField($name, $label, $desc)
+    {
+        return [
+            'type' => 'switch',
+            'label' => $label,
+            'name' => $name,
+            'is_bool' => true,
+            'desc' => $desc,
+            'values' => [
+                ['id' => $name . '_on', 'value' => 1, 'label' => $this->l('Sí')],
+                ['id' => $name . '_off', 'value' => 0, 'label' => $this->l('No')],
+            ],
+        ];
     }
 
     private function displayForm()
@@ -253,132 +547,77 @@ class Psmailspy extends Module
                     'icon' => 'icon-cogs',
                 ],
                 'input' => [
-                    [
-                        'type' => 'switch',
-                        'label' => $this->l('Activar Mail Spy'),
-                        'name' => self::CONFIG_ENABLED,
-                        'is_bool' => true,
-                        'desc' => $this->l('Activar o desactivar el interceptor de emails.'),
-                        'values' => [
-                            [
-                                'id' => 'active_on',
-                                'value' => true,
-                                'label' => $this->l('Activado')
-                            ],
-                            [
-                                'id' => 'active_off',
-                                'value' => false,
-                                'label' => $this->l('Desactivado')
-                            ]
-                        ],
-                    ],
+                    $this->switchField(self::CONFIG_ENABLED, $this->l('Activar Mail Spy'), $this->l('Enviar copia de los correos de la tienda.')),
                     [
                         'type' => 'text',
                         'label' => $this->l('Email principal'),
                         'name' => self::CONFIG_EMAIL,
-                        'size' => 50,
-                        'desc' => $this->l('Email principal donde se enviarán todas las copias.'),
-                        'required' => false,
+                        'desc' => $this->l('Correo donde llegarán las copias.'),
                     ],
                     [
                         'type' => 'textarea',
                         'label' => $this->l('Emails adicionales'),
                         'name' => self::CONFIG_MULTIPLE_EMAILS,
-                        'rows' => 3,
+                        'rows' => 2,
                         'cols' => 50,
-                        'desc' => $this->l('Emails adicionales separados por comas. Ejemplo: admin@example.com, dev@example.com'),
+                        'desc' => $this->l('Separados por comas. Ejemplo: admin@example.com, dev@example.com'),
+                    ],
+                    [
+                        'type' => 'radio',
+                        'label' => $this->l('Qué correos se copian'),
+                        'name' => self::CONFIG_SCOPE,
+                        'values' => [
+                            ['id' => 'scope_all', 'value' => 'all', 'label' => $this->l('Todos los que envía la tienda')],
+                            ['id' => 'scope_orders', 'value' => 'orders', 'label' => $this->l('Solo los de pedidos (confirmación, pago, envío, cambios de estado, devoluciones…)')],
+                            ['id' => 'scope_list', 'value' => 'list', 'label' => $this->l('Solo las plantillas de la lista de abajo')],
+                        ],
+                    ],
+                    [
+                        'type' => 'textarea',
+                        'label' => $this->l('Plantillas'),
+                        'name' => self::CONFIG_FILTER_TEMPLATES,
+                        'rows' => 2,
+                        'cols' => 50,
+                        'desc' => $this->l('Solo se usa con la tercera opción. Nombres de plantilla separados por comas. Ejemplo: order_conf, payment, shipped. El nombre de cada plantilla sale en el registro de abajo.'),
+                    ],
+                    [
+                        'type' => 'radio',
+                        'label' => $this->l('Cómo se envía la copia'),
+                        'name' => self::CONFIG_MODE,
+                        'desc' => $this->l('La copia oculta es exactamente el correo del cliente: mismo asunto, mismo contenido y mismos adjuntos, y en el «Para» ves a quién iba. El reenvío aparte es un segundo correo solo para ti, con el prefijo en el asunto para distinguirlo.'),
+                        'values' => [
+                            ['id' => 'mode_bcc', 'value' => 'bcc', 'label' => $this->l('Copia oculta (CCO) del mismo correo (recomendado)')],
+                            ['id' => 'mode_resend', 'value' => 'resend', 'label' => $this->l('Reenvío aparte con prefijo en el asunto')],
+                        ],
                     ],
                     [
                         'type' => 'text',
                         'label' => $this->l('Prefijo del asunto'),
                         'name' => self::CONFIG_PREFIX,
-                        'size' => 30,
-                        'desc' => $this->l('Prefijo que se añadirá al asunto de los emails interceptados.'),
+                        'class' => 'fixed-width-xl',
+                        'desc' => $this->l('Solo para el reenvío aparte.'),
                     ],
+                    $this->switchField(self::CONFIG_LOG_ENABLED, $this->l('Guardar registro'), $this->l('Anota cada correo copiado: fecha, destinatario, asunto y plantilla.')),
                     [
-                        'type' => 'textarea',
-                        'label' => $this->l('Filtrar plantillas'),
-                        'name' => self::CONFIG_FILTER_TEMPLATES,
-                        'rows' => 3,
-                        'cols' => 50,
-                        'desc' => $this->l('Plantillas de email a interceptar separadas por comas. Dejar vacío para todas. Usar "custom" para emails sin plantilla. Ejemplo: order_conf, payment, new_order, custom'),
-                    ],
-                    [
-                        'type' => 'switch',
-                        'label' => $this->l('Auto-detectar método'),
-                        'name' => self::CONFIG_DETECT_METHOD,
-                        'is_bool' => true,
-                        'desc' => $this->l('Detectar automáticamente el método de envío de emails configurado en PrestaShop.'),
-                        'values' => [
-                            [
-                                'id' => 'detect_on',
-                                'value' => true,
-                                'label' => $this->l('Activado')
-                            ],
-                            [
-                                'id' => 'detect_off',
-                                'value' => false,
-                                'label' => $this->l('Desactivado')
-                            ]
-                        ],
-                    ],
-                    [
-                        'type' => 'select',
-                        'label' => $this->l('Método interceptación SMTP'),
-                        'name' => self::CONFIG_SMTP_METHOD,
-                        'desc' => $this->l('Cuándo interceptar emails enviados vía SMTP. "Ambos" es la opción más compatible.'),
-                        'options' => [
-                            'query' => [
-                                ['id' => 'before', 'name' => $this->l('Antes del envío SMTP')],
-                                ['id' => 'after', 'name' => $this->l('Después del envío SMTP (solo exitosos)')],
-                                ['id' => 'both', 'name' => $this->l('Ambos (máxima compatibilidad)')],
-                            ],
-                            'id' => 'id',
-                            'name' => 'name',
-                        ],
-                    ],
-                    [
-                        'type' => 'switch',
-                        'label' => $this->l('Modo fallback'),
-                        'name' => self::CONFIG_FALLBACK_MODE,
-                        'is_bool' => true,
-                        'desc' => $this->l('Activar hooks adicionales para máxima compatibilidad con módulos terceros.'),
-                        'values' => [
-                            [
-                                'id' => 'fallback_on',
-                                'value' => true,
-                                'label' => $this->l('Activado (recomendado)')
-                            ],
-                            [
-                                'id' => 'fallback_off',
-                                'value' => false,
-                                'label' => $this->l('Desactivado')
-                            ]
-                        ],
-                    ],
-                    [
-                        'type' => 'switch',
-                        'label' => $this->l('Activar logging'),
-                        'name' => self::CONFIG_LOG_ENABLED,
-                        'is_bool' => true,
-                        'desc' => $this->l('Registrar todos los emails interceptados en la base de datos.'),
-                        'values' => [
-                            [
-                                'id' => 'log_on',
-                                'value' => true,
-                                'label' => $this->l('Activado')
-                            ],
-                            [
-                                'id' => 'log_off',
-                                'value' => false,
-                                'label' => $this->l('Desactivado')
-                            ]
-                        ],
+                        'type' => 'text',
+                        'label' => $this->l('Conservar el registro'),
+                        'name' => self::CONFIG_LOG_DAYS,
+                        'class' => 'fixed-width-sm',
+                        'suffix' => $this->l('días'),
                     ],
                 ],
                 'submit' => [
                     'title' => $this->l('Guardar configuración'),
-                    'class' => 'btn btn-default pull-right',
+                    'name' => 'submitMailSpyConfig',
+                ],
+                'buttons' => [
+                    [
+                        'type' => 'submit',
+                        'name' => 'submitMailSpyTest',
+                        'title' => $this->l('Enviar un correo de prueba'),
+                        'icon' => 'process-icon-envelope',
+                        'class' => 'btn btn-default pull-right',
+                    ],
                 ],
             ],
         ];
@@ -396,534 +635,37 @@ class Psmailspy extends Module
             . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name;
         $helper->token = Tools::getAdminTokenLite('AdminModules');
 
-        $helper->fields_value = $this->getConfigFormValues();
+        $values = [];
+        foreach (self::defaults() as $key => $default) {
+            $value = Configuration::get($key);
+            $values[$key] = $value === false ? $default : $value;
+        }
+        $helper->fields_value = $values;
 
         return $helper->generateForm([$fieldsForm]);
     }
 
-    private function getConfigFormValues()
+    private function displayLog()
     {
-        return [
-            self::CONFIG_EMAIL => Configuration::get(self::CONFIG_EMAIL),
-            self::CONFIG_ENABLED => Configuration::get(self::CONFIG_ENABLED),
-            self::CONFIG_PREFIX => Configuration::get(self::CONFIG_PREFIX),
-            self::CONFIG_LOG_ENABLED => Configuration::get(self::CONFIG_LOG_ENABLED),
-            self::CONFIG_MULTIPLE_EMAILS => Configuration::get(self::CONFIG_MULTIPLE_EMAILS),
-            self::CONFIG_FILTER_TEMPLATES => Configuration::get(self::CONFIG_FILTER_TEMPLATES),
-            self::CONFIG_SMTP_METHOD => Configuration::get(self::CONFIG_SMTP_METHOD),
-            self::CONFIG_DETECT_METHOD => Configuration::get(self::CONFIG_DETECT_METHOD),
-            self::CONFIG_FALLBACK_MODE => Configuration::get(self::CONFIG_FALLBACK_MODE),
-        ];
-    }
-
-    public function hookActionEmailSendBefore($params)
-    {
-        // CRÍTICO: Prevenir bucle infinito - NO interceptar emails del propio Mail Spy
-        if (!Configuration::get(self::CONFIG_ENABLED) || $this->isMailSpyEmail($params)) {
-            return true;
-        }
-
-        try {
-            $this->interceptEmail($params, 'before');
-        } catch (Exception $e) {
-            $this->logError('Error en hookActionEmailSendBefore: ' . $e->getMessage(), $params);
-        }
-        
-        return true;
-    }
-
-    public function hookActionEmailSendAfter($params)
-    {
-        if (!Configuration::get(self::CONFIG_ENABLED) || $this->isMailSpyEmail($params)) {
-            return true;
-        }
-
-        try {
-            if (Configuration::get(self::CONFIG_LOG_ENABLED)) {
-                $this->logEmailConfirmation($params);
-            }
-        } catch (Exception $e) {
-            $this->logError('Error en hookActionEmailSendAfter: ' . $e->getMessage(), $params);
-        }
-        
-        return true;
-    }
-
-    public function hookActionObjectMailMessageSendBefore($params)
-    {
-        if (!Configuration::get(self::CONFIG_ENABLED) || $this->isMailSpyEmail($params)) {
-            return true;
-        }
-
-        $smtpMethod = Configuration::get(self::CONFIG_SMTP_METHOD);
-        if ($smtpMethod === 'after') {
-            return true;
-        }
-
-        try {
-            $this->interceptSMTPEmail($params, 'before');
-        } catch (Exception $e) {
-            $this->logError('Error en hookActionObjectMailMessageSendBefore: ' . $e->getMessage(), $params);
-        }
-        
-        return true;
-    }
-
-    public function hookActionObjectMailMessageSendAfter($params)
-    {
-        if (!Configuration::get(self::CONFIG_ENABLED) || $this->isMailSpyEmail($params)) {
-            return true;
-        }
-
-        $smtpMethod = Configuration::get(self::CONFIG_SMTP_METHOD);
-        if ($smtpMethod === 'before') {
-            return true;
-        }
-
-        try {
-            $this->interceptSMTPEmail($params, 'after');
-        } catch (Exception $e) {
-            $this->logError('Error en hookActionObjectMailMessageSendAfter: ' . $e->getMessage(), $params);
-        }
-        
-        return true;
-    }
-
-    public function hookActionMailSend($params)
-    {
-        if (!Configuration::get(self::CONFIG_ENABLED) || !Configuration::get(self::CONFIG_FALLBACK_MODE) || $this->isMailSpyEmail($params)) {
-            return true;
-        }
-
-        try {
-            $params['_mailspy_source'] = 'actionMailSend';
-            $this->interceptEmail($params, 'fallback');
-        } catch (Exception $e) {
-            $this->logError('Error en hookActionMailSend: ' . $e->getMessage(), $params);
-        }
-        
-        return true;
-    }
-
-    public function hookDisplayBackOfficeHeader($params)
-    {
-        if (Tools::getValue('configure') !== $this->name) {
+        if (!Configuration::get(self::CONFIG_LOG_ENABLED)) {
             return '';
         }
-
-        return '<style>
-            .mailspy-info { background: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; }
-            .mailspy-status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
-            .mailspy-status.active { background: #28a745; color: white; }
-            .mailspy-status.inactive { background: #dc3545; color: white; }
-        </style>';
-    }
-
-    private function getDetectedEmailMethod()
-    {
-        $mailMethod = Configuration::get('PS_MAIL_METHOD');
-        $smtpServer = Configuration::get('PS_MAIL_SERVER');
-        
-        switch ($mailMethod) {
-            case '1':
-                return $this->l('PHP mail() function');
-            case '2':
-                return $this->l('SMTP') . ($smtpServer ? ' (' . $smtpServer . ')' : '');
-            case '3':
-                return $this->l('Sendmail');
-            default:
-                return $this->l('Deshabilitado o no configurado');
+        $rows = Db::getInstance()->executeS('SELECT * FROM `' . _DB_PREFIX_ . 'mailspy_log` WHERE `status` = "sent" ORDER BY `id_log` DESC LIMIT 50');
+        $html = '<div class="panel"><div class="panel-heading"><i class="icon-list"></i> ' . $this->l('Últimos correos copiados') . '</div>';
+        if (!$rows) {
+            return $html . '<p class="text-muted">' . $this->l('Todavía no se ha copiado ningún correo.') . '</p></div>';
         }
-    }
-
-    private function getActiveHooksInfo()
-    {
-        $hooks = [
-            'actionEmailSendBefore' => 'Estándar',
-            'actionEmailSendAfter' => 'Post-envío',
-            'actionObjectMailMessageSendBefore' => 'SMTP Pre',
-            'actionObjectMailMessageSendAfter' => 'SMTP Post',
-            'actionMailSend' => 'Fallback'
-        ];
-
-        $activeHooks = [];
-        foreach ($hooks as $hook => $name) {
-            if ($this->isRegisteredInHook($hook)) {
-                $activeHooks[] = $name;
-            }
+        $html .= '<div class="table-responsive"><table class="table table-condensed"><thead><tr><th>' . $this->l('Fecha') . '</th><th>' . $this->l('Para') . '</th><th>'
+            . $this->l('Asunto') . '</th><th>' . $this->l('Plantilla') . '</th><th>' . $this->l('Copia a') . '</th><th>' . $this->l('Modo') . '</th></tr></thead><tbody>';
+        foreach ($rows as $r) {
+            $html .= '<tr><td style="white-space:nowrap">' . Tools::safeOutput(date('d/m/Y H:i', strtotime($r['date_add']))) . '</td><td>' . Tools::safeOutput($r['recipient']) . '</td><td>'
+                . Tools::safeOutput($r['subject']) . '</td><td><code>' . Tools::safeOutput($r['template']) . '</code></td><td>' . Tools::safeOutput($r['spy_recipients']) . '</td><td>'
+                . ($r['error_message'] === 'reenvio' ? $this->l('Reenvío') : $this->l('CCO')) . '</td></tr>';
         }
+        $url = $this->context->link->getAdminLink('AdminModules', true) . '&configure=' . $this->name;
 
-        return implode(', ', $activeHooks);
-    }
-
-    private function isMailSpyEmail($params)
-    {
-        // Detectar SOLO si este email tiene nuestro prefijo en el asunto
-        $mailParams = $this->normalizeEmailParams($params);
-        
-        if (empty($mailParams)) {
-            return false;
-        }
-
-        // SOLO verificar asunto - no verificar destinatario porque puede ser legítimo
-        $subject = isset($mailParams['subject']) ? $mailParams['subject'] : '';
-        $prefix = Configuration::get(self::CONFIG_PREFIX) ?: '[MAIL SPY]';
-        
-        // Si ya tiene nuestro prefijo, es un email spy
-        return strpos($subject, $prefix) !== false;
-    }
-
-    private function interceptEmail($params, $hookType = 'before')
-    {
-        try {
-            static $processedEmails = [];
-            
-            $mailParams = $this->normalizeEmailParams($params);
-            
-            if (empty($mailParams)) {
-                return;
-            }
-
-            // Verificar que hay contenido para interceptar
-            if (!isset($mailParams['subject']) && !isset($mailParams['message']) && !isset($mailParams['template'])) {
-                return;
-            }
-
-            // Hash MÁS SIMPLE para evitar duplicados solo del mismo email
-            $subject = isset($mailParams['subject']) ? $mailParams['subject'] : 'no-subject';
-            $recipient = isset($mailParams['to']) ? $mailParams['to'] : (isset($mailParams['toEmail']) ? $mailParams['toEmail'] : 'no-recipient');
-            
-            $emailHash = md5($subject . '|' . $recipient . '|' . time());
-
-            // Solo evitar duplicados en la misma ejecución
-            if (isset($processedEmails[$emailHash])) {
-                return;
-            }
-            $processedEmails[$emailHash] = true;
-
-            // Aplicar filtros
-            $filterTemplates = Configuration::get(self::CONFIG_FILTER_TEMPLATES);
-            if (!empty($filterTemplates)) {
-                $allowedTemplates = array_map('trim', explode(',', $filterTemplates));
-                $currentTemplate = isset($mailParams['template']) ? $mailParams['template'] : 'custom';
-                
-                if (empty($currentTemplate)) {
-                    $currentTemplate = 'custom';
-                }
-                
-                if (!in_array($currentTemplate, $allowedTemplates) && !in_array('custom', $allowedTemplates)) {
-                    return;
-                }
-            }
-
-            $spyEmails = $this->getSpyEmails();
-            if (empty($spyEmails)) {
-                return;
-            }
-
-            $prefix = Configuration::get(self::CONFIG_PREFIX) ?: '[MAIL SPY]';
-            $originalSubject = isset($mailParams['subject']) ? $mailParams['subject'] : 'Sin asunto';
-            $newSubject = $prefix . ' ' . $originalSubject;
-            
-            $originalRecipient = isset($mailParams['to']) ? $mailParams['to'] : 
-                               (isset($mailParams['toEmail']) ? $mailParams['toEmail'] : 'Desconocido');
-            
-            // Enviar copias con el CONTENIDO ORIGINAL
-            foreach ($spyEmails as $spyEmail) {
-                $this->sendSpyEmailSafe($mailParams, $spyEmail, $newSubject, $originalRecipient);
-            }
-
-            if (Configuration::get(self::CONFIG_LOG_ENABLED)) {
-                $this->logEmailSafe($mailParams, $spyEmails, 'sent');
-            }
-
-        } catch (Exception $e) {
-            error_log('Mail Spy Intercept Error (non-critical): ' . $e->getMessage());
-        }
-    }
-
-    private function normalizeEmailParams($params)
-    {
-        if (isset($params['params'])) {
-            return $params['params'];
-        }
-        
-        if (isset($params['subject']) || isset($params['to']) || isset($params['toEmail'])) {
-            return $params;
-        }
-        
-        foreach ($params as $key => $value) {
-            if (is_array($value) && (isset($value['subject']) || isset($value['to']))) {
-                return $value;
-            }
-        }
-        
-        return $params;
-    }
-
-
-
-    private function getSpyEmails()
-    {
-        $emails = [];
-        
-        $mainEmail = Configuration::get(self::CONFIG_EMAIL);
-        if (!empty($mainEmail) && Validate::isEmail($mainEmail)) {
-            $emails[] = $mainEmail;
-        }
-
-        $multipleEmails = Configuration::get(self::CONFIG_MULTIPLE_EMAILS);
-        if (!empty($multipleEmails)) {
-            $additionalEmails = array_map('trim', explode(',', $multipleEmails));
-            foreach ($additionalEmails as $email) {
-                if (!empty($email) && Validate::isEmail($email) && !in_array($email, $emails)) {
-                    $emails[] = $email;
-                }
-            }
-        }
-
-        return $emails;
-    }
-
-    private function sendSpyEmailSafe($originalParams, $spyEmail, $subject, $originalRecipient)
-    {
-        try {
-            // Flag simple para prevenir bucle inmediato
-            static $sending = false;
-            
-            if ($sending) {
-                return;
-            }
-            
-            $sending = true;
-
-            // PRESERVAR el contenido original exacto
-            $templateVars = isset($originalParams['templateVars']) ? $originalParams['templateVars'] : [];
-            
-            // Añadir información del espía SIN sobreescribir variables originales
-            $templateVars['{spy_original_recipient}'] = $originalRecipient;
-            $templateVars['{spy_date}'] = date('Y-m-d H:i:s');
-            
-            // Si no hay templateVars, crear contenido básico
-            if (empty($templateVars)) {
-                $templateVars['{message}'] = "Email interceptado\nDestinatario original: " . $originalRecipient . "\nFecha: " . date('Y-m-d H:i:s');
-                $templateVars['{email}'] = $spyEmail;
-            }
-
-            // Usar configuración del email original para preservar formato
-            $langId = isset($originalParams['id_lang']) ? (int)$originalParams['id_lang'] : (int)Configuration::get('PS_LANG_DEFAULT');
-            if ($langId <= 0) $langId = 1;
-            
-            $shopId = isset($originalParams['id_shop']) ? (int)$originalParams['id_shop'] : (int)Context::getContext()->shop->id;
-            if ($shopId <= 0) $shopId = 1;
-
-            // USAR EL MISMO TEMPLATE que el email original para preservar formato
-            $template = isset($originalParams['template']) ? $originalParams['template'] : 'contact';
-            
-            // Verificar que el template existe
-            $templatePath = _PS_MAIL_DIR_ . Language::getIsoById($langId) . '/' . $template;
-            if (!file_exists($templatePath . '.html') && !file_exists($templatePath . '.txt')) {
-                $template = 'contact'; // Fallback seguro
-            }
-
-            // Enviar con la misma configuración que el original
-            $result = Mail::Send(
-                $langId,
-                $template,
-                $subject,
-                $templateVars,
-                $spyEmail,
-                null,
-                isset($originalParams['from']) ? $originalParams['from'] : null,
-                isset($originalParams['fromName']) ? $originalParams['fromName'] : null,
-                isset($originalParams['fileAttachment']) ? $originalParams['fileAttachment'] : null,
-                null,
-                _PS_MAIL_DIR_,
-                false,
-                $shopId
-            );
-
-            $sending = false;
-
-            if (!$result) {
-                error_log('Mail Spy: Failed to send spy email to ' . $spyEmail);
-            }
-
-        } catch (Exception $e) {
-            $sending = false;
-            error_log('Mail Spy Send Error (non-critical): ' . $e->getMessage());
-        }
-    }
-
-    private function logEmailSafe($params, $spyEmails, $status = 'sent', $errorMessage = null)
-    {
-        try {
-            $recipient = isset($params['to']) ? $params['to'] : 
-                        (isset($params['toEmail']) ? $params['toEmail'] : 'Desconocido');
-            $subject = isset($params['subject']) ? $params['subject'] : 'Sin asunto';
-            $template = isset($params['template']) ? $params['template'] : 'desconocido';
-
-            // Truncar datos largos para evitar errores de DB
-            $recipient = substr($recipient, 0, 250);
-            $subject = substr($subject, 0, 490);
-            $template = substr($template, 0, 90);
-
-            Db::getInstance()->insert('mailspy_log', [
-                'date_add' => date('Y-m-d H:i:s'),
-                'recipient' => pSQL($recipient),
-                'subject' => pSQL($subject), 
-                'template' => pSQL($template),
-                'status' => pSQL($status),
-                'error_message' => $errorMessage ? pSQL(substr($errorMessage, 0, 500)) : null,
-                'spy_recipients' => pSQL(substr(implode(', ', $spyEmails), 0, 500)),
-            ]);
-        } catch (Exception $e) {
-            // Solo log, nunca interrumpir
-            error_log('Mail Spy Log Error (non-critical): ' . $e->getMessage());
-        }
-    }
-
-    private function interceptSMTPEmail($params, $timing = 'before')
-    {
-        try {
-            $mailMessage = isset($params['mailMessage']) ? $params['mailMessage'] : null;
-            
-            if (!$mailMessage) {
-                return; // Salir silenciosamente
-            }
-
-            // Extraer datos de forma segura
-            $emailData = [
-                'subject' => method_exists($mailMessage, 'getSubject') ? $mailMessage->getSubject() : 'Sin asunto SMTP',
-                'to' => 'SMTP Recipient',
-                'template' => 'smtp_email',
-                'id_lang' => (int)Configuration::get('PS_LANG_DEFAULT') ?: 1,
-                'id_shop' => (int)Context::getContext()->shop->id ?: 1,
-            ];
-
-            // Intentar obtener destinatarios de forma segura
-            if (method_exists($mailMessage, 'getTo')) {
-                try {
-                    $toArray = $mailMessage->getTo();
-                    if (is_array($toArray) && !empty($toArray)) {
-                        $emailData['to'] = implode(', ', array_keys($toArray));
-                    }
-                } catch (Exception $e) {
-                    // Mantener valor por defecto
-                }
-            }
-
-            // Filtros (no críticos)
-            $filterTemplates = Configuration::get(self::CONFIG_FILTER_TEMPLATES);
-            if (!empty($filterTemplates)) {
-                $allowedTemplates = array_map('trim', explode(',', $filterTemplates));
-                if (!in_array('smtp_email', $allowedTemplates) && !in_array('custom', $allowedTemplates)) {
-                    return;
-                }
-            }
-
-            $spyEmails = $this->getSpyEmails();
-            if (empty($spyEmails)) {
-                return;
-            }
-
-            $prefix = Configuration::get(self::CONFIG_PREFIX) ?: '[MAIL SPY]';
-            $newSubject = $prefix . ' [SMTP-' . strtoupper($timing) . '] ' . $emailData['subject'];
-
-            // Envío seguro
-            foreach ($spyEmails as $spyEmail) {
-                $this->sendSMTPSpyEmailSafe($emailData, $spyEmail, $newSubject, $mailMessage);
-            }
-
-            // Logging seguro
-            if (Configuration::get(self::CONFIG_LOG_ENABLED)) {
-                $this->logEmailSafe($emailData, $spyEmails, 'sent');
-            }
-
-        } catch (Exception $e) {
-            // Solo log, nunca interrumpir
-            error_log('Mail Spy SMTP Intercept Error (non-critical): ' . $e->getMessage());
-        }
-    }
-
-    private function sendSMTPSpyEmailSafe($emailData, $spyEmail, $subject, $originalMessage = null)
-    {
-        try {
-            $message = "Email interceptado vía SMTP\n\n";
-            $message .= "Destinatario original: " . $emailData['to'] . "\n";
-            $message .= "Asunto original: " . str_replace(Configuration::get(self::CONFIG_PREFIX) ?: '[MAIL SPY]', '', $emailData['subject']) . "\n";
-            $message .= "Método: SMTP\n";
-            $message .= "Fecha: " . date('Y-m-d H:i:s') . "\n\n";
-            
-            // Contenido original (opcional y seguro)
-            if ($originalMessage && method_exists($originalMessage, 'getBody')) {
-                try {
-                    $body = $originalMessage->getBody();
-                    if (!empty($body)) {
-                        $message .= "Contenido original:\n" . substr($body, 0, 1000) . (strlen($body) > 1000 ? '...' : '');
-                    }
-                } catch (Exception $e) {
-                    $message .= "Contenido original: No disponible";
-                }
-            }
-
-            // Envío con configuración mínima
-            $result = Mail::Send(
-                $emailData['id_lang'],
-                'contact', // Template seguro
-                $subject,
-                [
-                    '{email}' => $spyEmail,
-                    '{message}' => $message,
-                ],
-                $spyEmail,
-                null,
-                null,
-                null,
-                null,
-                null,
-                _PS_MAIL_DIR_,
-                false,
-                $emailData['id_shop']
-            );
-
-            if (!$result) {
-                error_log('Mail Spy: Failed to send SMTP spy email to ' . $spyEmail);
-            }
-
-        } catch (Exception $e) {
-            error_log('Mail Spy SMTP Send Error (non-critical): ' . $e->getMessage());
-        }
-    }
-
-    private function logEmailConfirmation($params)
-    {
-        try {
-            $mailParams = $this->normalizeEmailParams($params);
-            
-            if (empty($mailParams)) {
-                return;
-            }
-
-            $recipient = isset($mailParams['to']) ? $mailParams['to'] : 
-                        (isset($mailParams['toEmail']) ? $mailParams['toEmail'] : 'Desconocido');
-            
-            $this->logEmailSafe($mailParams, [], 'confirmed', 'Email original confirmado: ' . $recipient);
-        } catch (Exception $e) {
-            error_log('Mail Spy Confirmation Log Error (non-critical): ' . $e->getMessage());
-        }
-    }
-
-    private function logError($message, $params = [])
-    {
-        try {
-            if (Configuration::get(self::CONFIG_LOG_ENABLED)) {
-                $this->logEmailSafe($params, [], 'failed', $message);
-            }
-        } catch (Exception $e) {
-            // Evitar bucles de errores
-        }
-        
-        error_log('Mail Spy Error (non-critical): ' . $message);
+        return $html . '</tbody></table></div>'
+            . '<form method="post" action="' . Tools::safeOutput($url) . '" class="panel-footer"><button type="submit" name="submitMailSpyClear" class="btn btn-default" onclick="return confirm(\''
+            . addslashes($this->l('¿Vaciar el registro?')) . '\');"><i class="icon-trash"></i> ' . $this->l('Vaciar el registro') . '</button></form></div>';
     }
 }
