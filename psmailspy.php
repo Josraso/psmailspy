@@ -58,7 +58,7 @@ class Psmailspy extends Module
     {
         $this->name = 'psmailspy';
         $this->tab = 'administration';
-        $this->version = '2.2.0';
+        $this->version = '2.2.1';
         $this->author = 'DevTeam';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = [
@@ -128,7 +128,7 @@ class Psmailspy extends Module
 
     private function uninstallConfiguration()
     {
-        foreach (array_merge(array_keys(self::defaults()), explode(',', self::OLD_KEYS), ['PSMAILSPY_UPD_TS', 'PSMAILSPY_UPD_INFO']) as $key) {
+        foreach (array_merge(array_keys(self::defaults()), explode(',', self::OLD_KEYS), ['PSMAILSPY_UPD_TS', 'PSMAILSPY_UPD_INFO', 'PSMAILSPY_UPD_SU', 'PSMAILSPY_UPD_LT']) as $key) {
             Configuration::deleteByName($key);
         }
 

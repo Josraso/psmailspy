@@ -1,5 +1,9 @@
 # Changelog - psmailspy
 
+## 2.2.1 - 2026-11-11
+- Actualizador: si el servidor de actualizaciones cambia de dominio, el módulo aprende la dirección nueva solo.
+- Actualizador preparado para licencias (desactivadas en este módulo).
+
 ## 2.2.0 - 2026-11-11
 - Nuevo bloque «Reenviarme los correos de un pedido»: buscas el pedido por número o referencia (o lo eliges entre
   los últimos) y te reenvías sus correos, de uno en uno o todos. Van solo a los correos configurados en el módulo,
