@@ -58,7 +58,7 @@ class Psmailspy extends Module
     {
         $this->name = 'psmailspy';
         $this->tab = 'administration';
-        $this->version = '2.2.2';
+        $this->version = '2.2.3';
         $this->author = 'DevTeam';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = [
