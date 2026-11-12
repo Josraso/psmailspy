@@ -2,7 +2,7 @@
 <module>
     <name>psmailspy</name>
     <displayName><![CDATA[Mail Spy Pro]]></displayName>
-    <version><![CDATA[2.2.1]]></version>
+    <version><![CDATA[2.2.2]]></version>
     <description><![CDATA[Envía a tu correo una copia de los emails que manda la tienda (todos, solo los de pedidos o las plantillas que elijas) para comprobar cómo llegan.]]></description>
     <author><![CDATA[DevTeam]]></author>
     <tab><![CDATA[administration]]></tab>
